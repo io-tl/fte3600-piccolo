@@ -1,22 +1,19 @@
-KERNEL_VERSION := $(shell uname -r)
-KERNELDIR := /lib/modules/$(KERNEL_VERSION)/build
-CURRENT_PATH := $(shell pwd)
-OBJ_NAME := focal_spi
+obj-m += focal_spi.o
 
-obj-m   += $(OBJ_NAME).o
+KERNELRELEASE ?= $(shell uname -r)
+KDIR ?= /lib/modules/$(KERNELRELEASE)/build
+M ?= $(CURDIR)
 
-build: kernel_modules
+.PHONY: all modules clean install
 
-kernel_modules:
-		$(MAKE) -C $(KERNELDIR) M=$(CURRENT_PATH) modules
+all: modules
 
-install: kernel_modules
-		install -p -D -m 0755 $(OBJ_NAME).ko  /lib/modules/$(KERNEL_VERSION)/kernel/drivers/spi/$(OBJ_NAME).ko
-		depmod
-		modprobe $(OBJ_NAME)
-				
+modules:
+	$(MAKE) -C $(KDIR) M=$(M) modules
+
 clean:
-		$(MAKE) -C $(KERNELDIR) M=$(CURRENT_PATH) clean
+	$(MAKE) -C $(KDIR) M=$(M) clean
 
-
-       
+install: modules
+	$(MAKE) -C $(KDIR) M=$(M) modules_install
+	depmod -a $(KERNELRELEASE)

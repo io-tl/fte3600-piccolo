@@ -1,0 +1,23 @@
+# External-module build products
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.o
+*.order
+*.symvers
+.*.cmd
+.*.d
+.tmp_versions/
+
+# Distribution package products
+*.pkg.tar.*
+*.deb
+pkg/
+src/
+
+# Editors and local diagnostics
+*~
+*.swp
+.cache/
+.local/

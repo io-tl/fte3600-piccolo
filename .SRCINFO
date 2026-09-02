@@ -1,0 +1,24 @@
+pkgbase = focaltech-ftexx00-dkms
+	pkgdesc = DKMS SPI transport for FocalTech FTE3600/FTE4800/FTE6600/FTE6900 fingerprint readers
+	pkgver = 0.1
+	pkgrel = 1
+	url = https://github.com/io-tl/fte3600-piccolo
+	arch = any
+	license = GPL-2.0-only
+	depends = dkms
+	optdepends = linux-headers: build for the Arch Linux kernel
+	optdepends = linux-lts-headers: build for the Arch Linux LTS kernel
+	provides = focaltech-spi-dkms
+	provides = focaltech-fte3600-piccolo-dkms
+	conflicts = focaltech-spi-dkms
+	conflicts = focaltech-fte3600-piccolo-dkms
+	source = focal_spi.c
+	source = Makefile
+	source = dkms.conf
+	source = COPYING
+	sha256sums = 86b10f3105ab71b1200daaf4084788a99446767c196f4aba8823c893e4b4f5de
+	sha256sums = 4aac305dfcf0a31e87596461ae8f757d373213384cc85043aa16d8484c0d4702
+	sha256sums = a2277c20e29925e24af7c38ed1b273f80102ef798b5b9f7779d888e1d6e4c6fd
+	sha256sums = a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499
+
+pkgname = focaltech-ftexx00-dkms
