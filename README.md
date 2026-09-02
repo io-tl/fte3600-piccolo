@@ -189,7 +189,7 @@ $ make clean
 ```
 
 The ABI notes are in [docs/ABI.md](docs/ABI.md). Hardware reports and patches
-are welcome; read [CONTRIBUTING.md](CONTRIBUTING.md) first.
+are welcome.
 
 ## Credits
 
@@ -197,4 +197,4 @@ The transport originated in FocalTech's Linux module and the
 FTEXX00-Ubuntu community work. Version 0.1 hardens and generalizes it from the
 X-Plus Piccolo bring-up while preserving the established userspace ABI.
 
-License: [GPL-2.0-only](COPYING).
+License: [GPL-2.0-only](LICENSE).
