@@ -13,6 +13,7 @@
 # Distribution package products
 *.pkg.tar.*
 *.deb
+focaltech-ftexx00-*.tar.gz
 pkg/
 src/
 

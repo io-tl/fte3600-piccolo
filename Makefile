@@ -4,9 +4,12 @@ KERNELRELEASE ?= $(shell uname -r)
 KDIR ?= /lib/modules/$(KERNELRELEASE)/build
 M ?= $(CURDIR)
 
-.PHONY: all modules clean install
+.PHONY: all modules clean install test
 
 all: modules
+
+test:
+	python3 tests/run-tests.py
 
 modules:
 	$(MAKE) -C $(KDIR) M=$(M) modules

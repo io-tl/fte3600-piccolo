@@ -10,6 +10,10 @@ Version 0.1 has been validated end-to-end on an X-Plus Piccolo with an
 and SDDM login. The other three ACPI IDs are supported by the original vendor
 transport but still need reports from their owners.
 
+Version 0.2 hardens IRQ notifications, suspend/resume, and device removal.
+It adds host-side regression tests; repeated authentication and sleep/wake
+cycles still need validation on each hardware/backend combination.
+
 ## Scope and licensing
 
 This repository contains only the GPL-2.0-only kernel transport. It does not
@@ -24,8 +28,8 @@ a compatible userspace libfprint backend obtained from a lawful source.
 - DKMS 2.x or 3.x
 - A compatible FocalTech userspace libfprint backend
 
-The current build is tested on Linux 7.1. CI checks older distribution kernels
-before each release.
+Version 0.2 has been compiled against Linux 7.2.11. CI also builds against
+Ubuntu 24.04 kernel headers.
 
 Confirm that the firmware exposes a supported device before installing:
 
@@ -39,14 +43,14 @@ DKMS 3.x can add a source checkout directly:
 
 ```console
 $ sudo dkms add .
-$ sudo dkms build -m focaltech-ftexx00 -v 0.1
-$ sudo dkms install -m focaltech-ftexx00 -v 0.1
+$ sudo dkms build -m focaltech-ftexx00 -v 0.2
+$ sudo dkms install -m focaltech-ftexx00 -v 0.2
 $ sudo modprobe focal_spi
 ```
 
-For DKMS 2.x, package managers should install `focal_spi.c`, `Makefile`, and
-`dkms.conf` into `/usr/src/focaltech-ftexx00-0.1`, then run the last three DKMS
-commands. Do not use `make install` when DKMS owns the module.
+For DKMS 2.x, package managers should install `focal_spi.c`, `focal_spi_uapi.h`,
+`Makefile`, and `dkms.conf` into `/usr/src/focaltech-ftexx00-0.2`, then run the
+last three DKMS commands. Do not use `make install` when DKMS owns the module.
 
 On Arch Linux and derivatives:
 
@@ -54,6 +58,12 @@ On Arch Linux and derivatives:
 $ makepkg -si
 $ sudo modprobe focal_spi
 ```
+
+To build the Arch package without installing it, run `makepkg`. The resulting
+`focaltech-ftexx00-dkms-0.2-1-any.pkg.tar.zst` contains the module sources;
+DKMS compiles them for the installed kernels when the package is installed.
+On Fedora and other distributions, use the source checkout and the DKMS
+commands above instead of the Arch package.
 
 At this point, `stat /dev/focal_moh_spi` should show the kernel transport. A
 userspace backend is still required before `fprintd-list` can find the reader.
@@ -156,6 +166,9 @@ Enrollment can then be started with `fprintd-enroll`. If fprintd reports no
 device, follow [Troubleshooting](docs/TROUBLESHOOTING.md) and include which
 backend package and checksum were used.
 
+If the reader stops responding after sleep, see the
+[resume diagnostics and optional backend recovery](docs/TROUBLESHOOTING.md#reader-stops-responding-after-sleep-or-repeated-use).
+
 ## Hardware adaptation
 
 The driver prefers a firmware `reset-gpios` property. When vendor ACPI exposes
@@ -183,6 +196,7 @@ See [Troubleshooting](docs/TROUBLESHOOTING.md) before changing parameters.
 ## Development
 
 ```console
+$ make test
 $ make
 $ modinfo ./focal_spi.ko
 $ make clean
@@ -190,6 +204,11 @@ $ make clean
 
 The ABI notes are in [docs/ABI.md](docs/ABI.md). Hardware reports and patches
 are welcome.
+
+`make test` requires Python 3 and a C compiler. Six focused regressions compile
+the driver's runtime functions against mock kernel and hardware interfaces:
+event delivery, resume and error recovery, file lifetime, and the transfer ABI.
+They do not exercise real SPI hardware or the proprietary libfprint backend.
 
 ## Credits
 

@@ -1,0 +1,14 @@
+[Unit]
+Description=Reinitialize the FocalTech fingerprint backend after sleep
+ConditionPathExists=/sys/module/focal_spi
+Before=sleep.target
+StopWhenUnneeded=yes
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/true
+ExecStop=/usr/bin/systemctl --no-block try-restart fprintd.service
+
+[Install]
+WantedBy=sleep.target

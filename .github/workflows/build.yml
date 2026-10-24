@@ -17,7 +17,9 @@ jobs:
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            build-essential linux-headers-generic kmod
+            build-essential linux-headers-generic kmod python3
+      - name: Run focused regression tests
+        run: make test
       - name: Build with warnings enabled
         run: |
           KDIR=$(find /usr/src -maxdepth 1 -type d -name 'linux-headers-*-generic' | sort -V | tail -n1)

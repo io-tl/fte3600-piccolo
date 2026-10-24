@@ -10,23 +10,32 @@
  */
 
 #include <linux/acpi.h>
+#include <linux/compat.h>
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
+#include <linux/kref.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/poll.h>
 #include <linux/slab.h>
 #include <linux/spi/spi.h>
+#include <linux/spinlock.h>
 #include <linux/uaccess.h>
+#if __has_include("linux/unaligned.h")
 #include <linux/unaligned.h>
+#else
+#include <asm/unaligned.h>
+#endif
+
+#include "focal_spi_uapi.h"
 
 #define FOCAL_DRIVER_NAME	"focaltech-ftexx00"
 #define FOCAL_DEVICE_NAME	"focal_moh_spi"
 #define FOCAL_IRQ_NAME		"focaltech-fingerprint"
-#define FOCAL_VERSION		"0.1"
+#define FOCAL_VERSION		"0.2"
 
 #define FOCAL_MAX_BUFFER_SIZE	(32 * 1024)
 #define FOCAL_DEFAULT_SPI_HZ	4000000
@@ -35,26 +44,6 @@
 #define FOCAL_SPI_READ_ONLY	0x5a
 #define FOCAL_SPI_READ_WRITE	0xa5
 #define FOCAL_SPI_BACK_DATA	0xb9
-
-/* These raw values are part of FocalTech's userspace ABI. */
-enum focal_ioctl_cmd {
-	FF_IOC_RESET_DEV = 0x8086,
-	FF_IOC_POWER_OFF,
-	FF_IOC_POWER_ON,
-	FF_IOC_IRQ_EN,
-	FF_IOC_LOG_EN,
-	FF_IOC_RELEASE_POLL,
-	FF_IOC_CSN,
-};
-
-enum focal_wake_event {
-	FOCAL_WAKE_EVENT_NONE = 0,
-	FOCAL_WAKE_EVENT_ENABLE,
-	FOCAL_WAKE_EVENT_INT,
-	FOCAL_WAKE_EVENT_RESUME,
-	FOCAL_WAKE_EVENT_SUSPEND,
-	FOCAL_WAKE_EVENT_DISABLE,
-};
 
 /* The vendor ABI uses a packed, little-endian five-byte header. */
 struct focal_spi_packet {
@@ -70,10 +59,20 @@ struct focal_fp_data {
 	struct spi_device *spi;
 	struct gpio_desc *reset_gpio;
 	struct miscdevice miscdev;
+	struct kref refcount;
 	struct mutex io_lock;
+	/* Lock order: io_lock -> event_lock; the IRQ takes only event_lock. */
+	spinlock_t event_lock;
 	wait_queue_head_t poll_wait;
-	enum focal_wake_event wake_event;
+	unsigned long pending_events;
+	bool explicit_events;
+	bool removed;
 	bool initialized;
+	bool suspended;
+	/* Written with both locks; read with either io_lock or event_lock. */
+	int resume_error;
+	bool reset_asserted;
+	bool irq_requested;
 	bool irq_disabled;
 	bool claimed;
 	bool debug_enabled;
@@ -112,6 +111,21 @@ static struct focal_fp_data *focal_file_data(struct file *file)
 	return file->private_data;
 }
 
+static void focal_free(struct kref *ref)
+{
+	struct focal_fp_data *data = container_of(ref, struct focal_fp_data,
+							 refcount);
+
+	kfree(data);
+}
+
+static void focal_put(void *argument)
+{
+	struct focal_fp_data *data = argument;
+
+	kref_put(&data->refcount, focal_free);
+}
+
 static void focal_debug(struct focal_fp_data *data, const char *message)
 {
 	if (data->debug_enabled)
@@ -121,19 +135,127 @@ static void focal_debug(struct focal_fp_data *data, const char *message)
 static void focal_wake_userspace(struct focal_fp_data *data,
 				 enum focal_wake_event event)
 {
-	WRITE_ONCE(data->wake_event, event);
+	unsigned long flags;
+
+	spin_lock_irqsave(&data->event_lock, flags);
+	if (data->removed)
+		goto out_unlock;
+
+	switch (event) {
+	case FOCAL_WAKE_EVENT_NONE:
+		/* Explicit vendor rearm/clear, not an IRQ acknowledgment. */
+		data->pending_events = 0;
+		break;
+	case FOCAL_WAKE_EVENT_ENABLE:
+		data->pending_events &= ~BIT(FOCAL_WAKE_EVENT_DISABLE);
+		data->pending_events |= BIT(event);
+		break;
+	case FOCAL_WAKE_EVENT_INT:
+		/* A touch must never replace a pending stop or PM notification. */
+		if (!(data->pending_events & BIT(FOCAL_WAKE_EVENT_DISABLE))) {
+			data->pending_events &= ~BIT(FOCAL_WAKE_EVENT_ENABLE);
+			data->pending_events |= BIT(event);
+		}
+		break;
+	case FOCAL_WAKE_EVENT_SUSPEND:
+	case FOCAL_WAKE_EVENT_RESUME:
+		/* Frozen userspace needs the latest PM state, not a stale touch. */
+		data->pending_events &= ~(BIT(FOCAL_WAKE_EVENT_SUSPEND) |
+					  BIT(FOCAL_WAKE_EVENT_RESUME) |
+					  BIT(FOCAL_WAKE_EVENT_INT));
+		data->pending_events |= BIT(event);
+		break;
+	case FOCAL_WAKE_EVENT_DISABLE:
+		data->pending_events &= ~(BIT(FOCAL_WAKE_EVENT_ENABLE) |
+					  BIT(FOCAL_WAKE_EVENT_INT));
+		data->pending_events |= BIT(event);
+		break;
+	}
+
+out_unlock:
+	spin_unlock_irqrestore(&data->event_lock, flags);
 	wake_up_interruptible(&data->poll_wait);
+}
+
+/* Caller holds event_lock. Control events have priority over touches. */
+static enum focal_wake_event focal_next_event(struct focal_fp_data *data)
+{
+	if (data->pending_events & BIT(FOCAL_WAKE_EVENT_DISABLE))
+		return FOCAL_WAKE_EVENT_DISABLE;
+	if (data->pending_events & BIT(FOCAL_WAKE_EVENT_RESUME))
+		return FOCAL_WAKE_EVENT_RESUME;
+	if (data->pending_events & BIT(FOCAL_WAKE_EVENT_SUSPEND))
+		return FOCAL_WAKE_EVENT_SUSPEND;
+	if (data->pending_events & BIT(FOCAL_WAKE_EVENT_INT))
+		return FOCAL_WAKE_EVENT_INT;
+	if (data->pending_events & BIT(FOCAL_WAKE_EVENT_ENABLE))
+		return FOCAL_WAKE_EVENT_ENABLE;
+	return FOCAL_WAKE_EVENT_NONE;
+}
+
+/* Caller holds io_lock. Do not take event_lock across disable_irq(). */
+static void focal_update_irq(struct focal_fp_data *data)
+{
+	bool enable = data->initialized && data->claimed &&
+		      data->irq_requested && !data->suspended && !data->resume_error;
+
+	if (enable && data->irq_disabled) {
+		data->irq_disabled = false;
+		enable_irq(data->spi->irq);
+	} else if (!enable && !data->irq_disabled) {
+		disable_irq(data->spi->irq);
+		data->irq_disabled = true;
+	}
+}
+
+/* Caller holds io_lock, which also serializes removal and system sleep. */
+static int focal_io_available(struct focal_fp_data *data)
+{
+	if (!data->initialized)
+		return -ENODEV;
+	if (data->suspended)
+		return -EHOSTDOWN;
+	return data->resume_error;
+}
+
+/* Caller holds io_lock; a new open or explicit reset may retry a failed resume. */
+static int focal_restore_transport(struct focal_fp_data *data)
+{
+	unsigned long flags;
+	int ret;
+
+	/* Do not pulse reset: reloading sensor configuration belongs to userspace. */
+	ret = gpiod_direction_output(data->reset_gpio, data->reset_asserted);
+	if (!ret)
+		ret = spi_setup(data->spi);
+
+	spin_lock_irqsave(&data->event_lock, flags);
+	data->resume_error = ret;
+	spin_unlock_irqrestore(&data->event_lock, flags);
+	if (ret) {
+		dev_err_ratelimited(&data->spi->dev,
+				    "failed to restore transport after sleep: %d\n", ret);
+		wake_up_interruptible(&data->poll_wait);
+		return ret;
+	}
+
+	focal_wake_userspace(data, FOCAL_WAKE_EVENT_RESUME);
+	focal_update_irq(data);
+	focal_debug(data, "transport resumed");
+	return 0;
 }
 
 static void focal_assert_reset(struct focal_fp_data *data)
 {
 	/* GPIO descriptor values are logical: one means asserted. */
 	gpiod_set_value_cansleep(data->reset_gpio, 1);
+	data->reset_asserted = true;
 }
 
 static void focal_deassert_reset(struct focal_fp_data *data)
 {
 	gpiod_set_value_cansleep(data->reset_gpio, 0);
+	data->reset_asserted = false;
 }
 
 static void focal_hw_reset(struct focal_fp_data *data)
@@ -147,9 +269,6 @@ static void focal_hw_reset(struct focal_fp_data *data)
 static int focal_spi_transfer(struct focal_fp_data *data, u16 tx_len,
 			      u16 rx_len)
 {
-	if (!READ_ONCE(data->initialized))
-		return -ENODEV;
-
 	if (tx_len)
 		return spi_write_then_read(data->spi, data->write_buffer, tx_len,
 					   data->read_buffer, rx_len);
@@ -161,19 +280,30 @@ static int focal_open(struct inode *inode, struct file *file)
 {
 	struct miscdevice *misc = file->private_data;
 	struct focal_fp_data *data;
+	unsigned long flags;
 	int ret = 0;
 
 	data = container_of(misc, struct focal_fp_data, miscdev);
 	mutex_lock(&data->io_lock);
-	if (!data->initialized)
-		ret = -ENODEV;
-	else if (data->claimed)
+	if (data->initialized && !data->suspended && !data->claimed &&
+	    data->resume_error)
+		focal_restore_transport(data);
+	ret = focal_io_available(data);
+	if (ret)
+		goto out_unlock;
+	if (data->claimed)
 		ret = -EBUSY;
 	else {
+		/* misc_open and misc_deregister serialize access to the base ref. */
+		kref_get(&data->refcount);
 		data->claimed = true;
-		data->wake_event = FOCAL_WAKE_EVENT_NONE;
+		spin_lock_irqsave(&data->event_lock, flags);
+		data->pending_events = 0;
+		data->explicit_events = false;
+		spin_unlock_irqrestore(&data->event_lock, flags);
 		file->private_data = data;
 	}
+out_unlock:
 	mutex_unlock(&data->io_lock);
 
 	return ret;
@@ -184,13 +314,15 @@ static int focal_release(struct inode *inode, struct file *file)
 	struct focal_fp_data *data = focal_file_data(file);
 
 	mutex_lock(&data->io_lock);
-	if (!data->irq_disabled) {
-		disable_irq(data->spi->irq);
-		data->irq_disabled = true;
-	}
-	data->wake_event = FOCAL_WAKE_EVENT_NONE;
+	data->irq_requested = false;
 	data->claimed = false;
+	/* GPIOs, buffers and the IRQ may already be gone after unbind. */
+	if (data->initialized)
+		focal_update_irq(data);
+	focal_wake_userspace(data, FOCAL_WAKE_EVENT_NONE);
+	data->debug_enabled = false;
 	mutex_unlock(&data->io_lock);
+	focal_put(data);
 
 	return 0;
 }
@@ -199,8 +331,7 @@ static irqreturn_t focal_spi_irq_handler(int irq, void *dev_id)
 {
 	struct focal_fp_data *data = dev_id;
 
-	if (READ_ONCE(data->wake_event) <= FOCAL_WAKE_EVENT_ENABLE)
-		focal_wake_userspace(data, FOCAL_WAKE_EVENT_INT);
+	focal_wake_userspace(data, FOCAL_WAKE_EVENT_INT);
 
 	return IRQ_HANDLED;
 }
@@ -219,10 +350,9 @@ static ssize_t focal_read(struct file *file, char __user *user_buffer,
 	if (mutex_lock_interruptible(&data->io_lock))
 		return -ERESTARTSYS;
 
-	if (!data->initialized) {
-		ret = -ENODEV;
+	ret = focal_io_available(data);
+	if (ret)
 		goto out_unlock;
-	}
 
 	if (copy_from_user(data->write_buffer, user_buffer, count)) {
 		ret = -EFAULT;
@@ -267,8 +397,12 @@ static ssize_t focal_read(struct file *file, char __user *user_buffer,
 		memmove(data->write_buffer, packet->payload, tx_len);
 
 	ret = focal_spi_transfer(data, tx_len, rx_len);
-	if (ret)
+	if (ret) {
+		dev_err_ratelimited(&data->spi->dev,
+				    "SPI read failed: %zd (tx=%u rx=%u)\n",
+				    ret, tx_len, rx_len);
 		goto out_unlock;
+	}
 
 	if (copy_to_user(user_buffer, data->read_buffer, rx_len)) {
 		ret = -EFAULT;
@@ -297,10 +431,9 @@ static ssize_t focal_write(struct file *file, const char __user *user_buffer,
 	if (mutex_lock_interruptible(&data->io_lock))
 		return -ERESTARTSYS;
 
-	if (!data->initialized) {
-		ret = -ENODEV;
+	ret = focal_io_available(data);
+	if (ret)
 		goto out_unlock;
-	}
 
 	if (copy_from_user(data->write_buffer, user_buffer, count)) {
 		ret = -EFAULT;
@@ -309,6 +442,8 @@ static ssize_t focal_write(struct file *file, const char __user *user_buffer,
 
 	packet = (struct focal_spi_packet *)data->write_buffer;
 	if (packet->type == FOCAL_SPI_BACK_DATA) {
+		/* A shorter replacement must not expose the old cache's tail. */
+		memset(data->sensor_init_data, 0, FOCAL_MAX_BUFFER_SIZE);
 		memcpy(data->sensor_init_data, data->write_buffer, count);
 		ret = count;
 		goto out_unlock;
@@ -318,6 +453,10 @@ static ssize_t focal_write(struct file *file, const char __user *user_buffer,
 	ret = spi_write(data->spi, packet->payload, payload_len);
 	if (!ret)
 		ret = count;
+	else
+		dev_err_ratelimited(&data->spi->dev,
+				    "SPI write failed: %zd (tx=%zu)\n",
+				    ret, payload_len);
 
 out_unlock:
 	mutex_unlock(&data->io_lock);
@@ -328,6 +467,9 @@ static long focal_ioctl(struct file *file, unsigned int command,
 			unsigned long argument)
 {
 	struct focal_fp_data *data = focal_file_data(file);
+	void __user *user_arg = (void __user *)argument;
+	unsigned long flags;
+	__u32 value;
 	long ret = 0;
 
 	if (mutex_lock_interruptible(&data->io_lock))
@@ -336,6 +478,19 @@ static long focal_ioctl(struct file *file, unsigned int command,
 	if (!data->initialized) {
 		ret = -ENODEV;
 		goto out_unlock;
+	}
+
+	if (command == FF_IOC_RESET_DEV || command == FF_IOC_POWER_OFF ||
+	    command == FF_IOC_POWER_ON) {
+		if (data->suspended) {
+			ret = -EHOSTDOWN;
+			goto out_unlock;
+		}
+		if (data->resume_error) {
+			ret = focal_restore_transport(data);
+			if (ret)
+				goto out_unlock;
+		}
 	}
 
 	switch (command) {
@@ -349,13 +504,8 @@ static long focal_ioctl(struct file *file, unsigned int command,
 		focal_deassert_reset(data);
 		break;
 	case FF_IOC_IRQ_EN:
-		if (argument && data->irq_disabled) {
-			enable_irq(data->spi->irq);
-			data->irq_disabled = false;
-		} else if (!argument && !data->irq_disabled) {
-			disable_irq(data->spi->irq);
-			data->irq_disabled = true;
-		}
+		data->irq_requested = !!argument;
+		focal_update_irq(data);
 		break;
 	case FF_IOC_LOG_EN:
 		data->debug_enabled = !!argument;
@@ -371,6 +521,42 @@ static long focal_ioctl(struct file *file, unsigned int command,
 	case FF_IOC_CSN:
 		/* Chip select is managed by the SPI controller. */
 		break;
+	case FOCAL_IOC_SET_EVENT_MODE:
+		if (copy_from_user(&value, user_arg, sizeof(value))) {
+			ret = -EFAULT;
+			break;
+		}
+		if (value != FOCAL_EVENT_MODE_LEGACY &&
+		    value != FOCAL_EVENT_MODE_EXPLICIT) {
+			ret = -EINVAL;
+			break;
+		}
+		spin_lock_irqsave(&data->event_lock, flags);
+		data->explicit_events = value == FOCAL_EVENT_MODE_EXPLICIT;
+		spin_unlock_irqrestore(&data->event_lock, flags);
+		wake_up_interruptible(&data->poll_wait);
+		break;
+	case FOCAL_IOC_GET_EVENT:
+		spin_lock_irqsave(&data->event_lock, flags);
+		if (!data->explicit_events) {
+			spin_unlock_irqrestore(&data->event_lock, flags);
+			ret = -EINVAL;
+			break;
+		}
+		value = focal_next_event(data);
+		data->pending_events &= ~BIT(value);
+		spin_unlock_irqrestore(&data->event_lock, flags);
+		if (copy_to_user(user_arg, &value, sizeof(value))) {
+			/* io_lock excludes PM/control writers; IRQs may still arrive. */
+			if (value != FOCAL_WAKE_EVENT_NONE) {
+				spin_lock_irqsave(&data->event_lock, flags);
+				data->pending_events |= BIT(value);
+				spin_unlock_irqrestore(&data->event_lock, flags);
+				wake_up_interruptible(&data->poll_wait);
+			}
+			ret = -EFAULT;
+		}
+		break;
 	default:
 		ret = -ENOTTY;
 	}
@@ -384,6 +570,9 @@ out_unlock:
 static long focal_compat_ioctl(struct file *file, unsigned int command,
 			       unsigned long argument)
 {
+	/* The vendor commands take scalars; only the new ioctls take pointers. */
+	if (command == FOCAL_IOC_SET_EVENT_MODE || command == FOCAL_IOC_GET_EVENT)
+		argument = (unsigned long)compat_ptr(argument);
 	return focal_ioctl(file, command, argument);
 }
 #endif
@@ -392,12 +581,39 @@ static __poll_t focal_poll(struct file *file, poll_table *wait)
 {
 	struct focal_fp_data *data = focal_file_data(file);
 	enum focal_wake_event event;
+	unsigned long flags;
+	__poll_t mask;
 
 	poll_wait(file, &data->poll_wait, wait);
-	event = xchg(&data->wake_event, FOCAL_WAKE_EVENT_NONE);
+	spin_lock_irqsave(&data->event_lock, flags);
+	if (data->removed) {
+		mask = EPOLLERR | EPOLLHUP;
+		goto out_unlock;
+	}
+	if (data->resume_error) {
+		mask = EPOLLERR;
+		goto out_unlock;
+	}
 
-	/* Event values double as the mask expected by the userspace backend. */
-	return (__poll_t)event;
+	event = focal_next_event(data);
+	if (data->explicit_events) {
+		/* Level-triggered: only GET_EVENT acknowledges the notification. */
+		mask = event ? EPOLLIN | EPOLLRDNORM : 0;
+	} else {
+		/*
+		 * Preserve the vendor's consume-on-poll ABI, but never consume an
+		 * event the VFS would discard or truncate with the caller's mask.
+		 * This legacy mode is not suitable for epoll's repeated probes.
+		 */
+		mask = (__poll_t)event;
+		if ((poll_requested_events(wait) & mask) == mask)
+			data->pending_events &= ~BIT(event);
+		else
+			mask = 0;
+	}
+out_unlock:
+	spin_unlock_irqrestore(&data->event_lock, flags);
+	return mask;
 }
 
 static const struct file_operations focal_fops = {
@@ -515,12 +731,19 @@ static int focal_spi_probe(struct spi_device *spi)
 	struct focal_fp_data *data;
 	int ret;
 
-	data = devm_kzalloc(&spi->dev, sizeof(*data), GFP_KERNEL);
+	data = kzalloc(sizeof(*data), GFP_KERNEL);
 	if (!data)
 		return -ENOMEM;
 
+	kref_init(&data->refcount);
+	/* Registered first, released last, after the IRQ and GPIO mappings. */
+	ret = devm_add_action_or_reset(&spi->dev, focal_put, data);
+	if (ret)
+		return ret;
+
 	data->spi = spi;
 	mutex_init(&data->io_lock);
+	spin_lock_init(&data->event_lock);
 	init_waitqueue_head(&data->poll_wait);
 	spi_set_drvdata(spi, data);
 
@@ -540,12 +763,12 @@ static int focal_spi_probe(struct spi_device *spi)
 				     "firmware did not provide an IRQ\n");
 
 	ret = devm_request_threaded_irq(&spi->dev, spi->irq, NULL,
-					focal_spi_irq_handler, IRQF_ONESHOT,
+					focal_spi_irq_handler,
+					IRQF_ONESHOT | IRQF_NO_AUTOEN,
 					FOCAL_IRQ_NAME, data);
 	if (ret)
 		return dev_err_probe(&spi->dev, ret, "failed to request IRQ\n");
 
-	disable_irq(spi->irq);
 	data->irq_disabled = true;
 	data->initialized = true;
 
@@ -558,8 +781,6 @@ static int focal_spi_probe(struct spi_device *spi)
 	ret = misc_register(&data->miscdev);
 	if (ret) {
 		data->initialized = false;
-		enable_irq(spi->irq);
-		data->irq_disabled = false;
 		return dev_err_probe(&spi->dev, ret,
 				     "failed to register userspace transport\n");
 	}
@@ -572,32 +793,54 @@ static int focal_spi_probe(struct spi_device *spi)
 static void focal_spi_remove(struct spi_device *spi)
 {
 	struct focal_fp_data *data = spi_get_drvdata(spi);
+	unsigned long flags;
 
 	misc_deregister(&data->miscdev);
-	WRITE_ONCE(data->initialized, false);
-	focal_wake_userspace(data, FOCAL_WAKE_EVENT_DISABLE);
+	mutex_lock(&data->io_lock);
+	data->initialized = false;
+	data->irq_requested = false;
+	focal_update_irq(data);
+	devm_free_irq(&spi->dev, spi->irq, data);
 
-	/* Balance disable_irq() before the managed IRQ is released. */
-	if (data->irq_disabled) {
-		enable_irq(spi->irq);
-		data->irq_disabled = false;
-	}
+	spin_lock_irqsave(&data->event_lock, flags);
+	data->removed = true;
+	data->pending_events = 0;
+	spin_unlock_irqrestore(&data->event_lock, flags);
+	mutex_unlock(&data->io_lock);
+	wake_up_interruptible(&data->poll_wait);
+	/* The managed base ref and any open-file refs keep data alive. */
 }
 
 static int focal_spi_suspend(struct device *dev)
 {
 	struct focal_fp_data *data = spi_get_drvdata(to_spi_device(dev));
 
-	focal_wake_userspace(data, FOCAL_WAKE_EVENT_SUSPEND);
+	mutex_lock(&data->io_lock);
+	if (data->initialized && !data->suspended) {
+		data->suspended = true;
+		/* Drain the IRQ thread before publishing the PM state. */
+		focal_update_irq(data);
+		focal_wake_userspace(data, FOCAL_WAKE_EVENT_SUSPEND);
+		focal_debug(data, "transport suspended");
+	}
+	mutex_unlock(&data->io_lock);
 	return 0;
 }
 
 static int focal_spi_resume(struct device *dev)
 {
 	struct focal_fp_data *data = spi_get_drvdata(to_spi_device(dev));
+	int ret = 0;
 
-	focal_wake_userspace(data, FOCAL_WAKE_EVENT_RESUME);
-	return 0;
+	mutex_lock(&data->io_lock);
+	if (!data->initialized || (!data->suspended && !data->resume_error))
+		goto out_unlock;
+
+	data->suspended = false;
+	ret = focal_restore_transport(data);
+out_unlock:
+	mutex_unlock(&data->io_lock);
+	return ret;
 }
 
 static DEFINE_SIMPLE_DEV_PM_OPS(focal_spi_pm_ops, focal_spi_suspend,
